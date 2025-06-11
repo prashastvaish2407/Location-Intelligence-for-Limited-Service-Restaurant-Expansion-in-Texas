@@ -1,0 +1,575 @@
+-- Research Questions - Questions we want to answer to make a decision
+
+--Question 1: Which counties in Texas are in the top 33rd percentile for both proportion of target age group and proportion of target income group? (Target age group: 10 – 35, target income group: <= 75k)
+
+--Table Creation
+CREATE OR REPLACE TABLE `group-7-fa24-mgmt58200-final.safegraph.population_filter` AS
+(
+    WITH cte_county_population AS
+    (
+        SELECT 
+			b.state, b.state_fips, b.county, b.county_fips,
+			--Target population
+			SUM(`pop_f_10-14` + `pop_m_15-17` + `pop_m_18-19` + `pop_m_20` + `pop_m_21` + `pop_m_22-24` + `pop_m_25-29` + `pop_m_30-34` + `pop_m_35-39` + `pop_f_15-17` + `pop_f_18-19` + `pop_f_20` + `pop_f_21` + `pop_f_22-24` + `pop_f_25-29` + `pop_f_30-34`) AS population_10_35,
+			--Total Population
+			SUM(a.pop_total) AS total_population,
+			--Target Income group
+			SUM(`inc_lt10` + `inc_10-15` + `inc_15-20` + `inc_20-25` + `inc_25-30` + `inc_30-35` + `inc_35-40` + `inc_40-45` + `inc_45-50` + `inc_50-60` + `inc_60-75`) AS income_less_75,
+			--Total Earners
+			SUM(inc_total) AS total_earning_population
+        FROM `group-7-fa24-mgmt58200-final.safegraph.cbg_demographics` a
+        INNER JOIN `group-7-fa24-mgmt58200-final.safegraph.cbg_fips` b
+		--first 2 digits are state and next 3 digits are county
+        ON LEFT(a.cbg, 5) = CONCAT(b.state_fips, b.county_fips)
+        GROUP BY b.state, b.state_fips, b.county, b.county_fips
+		-- Filtering in counties with a minimum population of 10k and minimum earners of 2k
+        HAVING total_population > 10000 AND total_earning_population > 2000
+    ),
+    
+    cte_ranking AS
+    (
+        SELECT 
+			state, state_fips, county, county_fips, population_10_35, total_population, population_10_35_perc,
+			--Ranking counties based on population proportion
+			DENSE_RANK() OVER(ORDER BY population_10_35_perc DESC) AS population_10_35_rank,
+			income_less_75, total_earning_population, income_less_75_perc,
+			--Ranking counties based on income proportion
+			DENSE_RANK() OVER(ORDER BY income_less_75_perc DESC) AS income_less_75_rank
+        FROM
+        (
+            SELECT state, state_fips, county, county_fips, population_10_35, total_population,
+			--Calculating population proportion
+            round(population_10_35 / total_population,4) AS population_10_35_perc,
+            income_less_75, total_earning_population,
+			--Calculating proportion of earners with income below 75K
+            round(income_less_75 / total_earning_population,4) AS income_less_75_perc
+            FROM cte_county_population
+        )
+		--Filtering for State of Texas
+        WHERE TRIM(state) LIKE 'TX'
+    ),
+    
+    ranked_data AS 
+    (
+        SELECT 
+			state, state_fips, county, county_fips, population_10_35, total_population, population_10_35_perc, population_10_35_rank,
+			--Calculating percentile from rank
+			round(PERCENT_RANK() OVER (ORDER BY population_10_35_rank),4) AS population_10_35_percentile,
+			income_less_75, total_earning_population, income_less_75_perc, income_less_75_rank,
+			--Calculating percentile from rank
+			round(PERCENT_RANK() OVER (ORDER BY income_less_75_rank),4) AS income_less_75_percentile
+        FROM cte_ranking
+    )
+    
+    SELECT * 
+    FROM ranked_data
+	--Filtering in top 33%
+    WHERE population_10_35_percentile <= 0.33
+    AND income_less_75_percentile <= 0.33
+);
+
+--Result
+SELECT * 
+FROM `group-7-fa24-mgmt58200-final.safegraph.population_filter`;
+
+
+--------------------------------------------------------------------------------------------------------------------------------------
+
+
+--Question 2: Out of the counties identified in Q1, which counties are under-served? The definition of ‘under-served’ being that they must be in the bottom 33rd percentile among all counties in Texas for restaurants per capita. Among the underserved counties, we will pick the one with the highest population in the target age group.  
+
+--Table Creation
+CREATE OR REPLACE TABLE `group-7-fa24-mgmt58200-final.safegraph.underserved_filter` AS
+WITH cte_county_population AS
+(
+    SELECT 
+		b.state, b.state_fips, b.county, b.county_fips, 
+		SUM(`pop_f_10-14` + `pop_m_15-17` + `pop_m_18-19` + `pop_m_20` + `pop_m_21` + `pop_m_22-24` + `pop_m_25-29` + `pop_m_30-34` + `pop_m_35-39` + `pop_f_15-17` + `pop_f_18-19` + `pop_f_20` + `pop_f_21` + `pop_f_22-24` + `pop_f_25-29` + `pop_f_30-34`) AS population_10_35, 
+		SUM(a.pop_total) AS total_population, 
+		SUM(inc_total) AS total_earning_population 
+    FROM `group-7-fa24-mgmt58200-final.safegraph.cbg_demographics` a 
+    INNER JOIN `group-7-fa24-mgmt58200-final.safegraph.cbg_fips` b 
+    ON LEFT(a.cbg, 5) = CONCAT(b.state_fips, b.county_fips) 
+    GROUP BY b.state, b.state_fips, b.county, b.county_fips 
+    HAVING total_population > 10000 AND total_earning_population > 2000
+), 
+
+cte_lsr_restaurant AS
+(
+    SELECT 
+		c.state, c.state_fips, c.county, c.county_fips, 
+		COUNT(DISTINCT b.safegraph_place_id) AS lsr_restaurant_count 
+    FROM `group-7-fa24-mgmt58200-final.safegraph.places` a 
+    INNER JOIN `group-7-fa24-mgmt58200-final.safegraph.visits` b 
+    ON a.safegraph_place_id = b.safegraph_place_id 
+    INNER JOIN `group-7-fa24-mgmt58200-final.safegraph.cbg_fips` c 
+    ON LEFT(b.poi_cbg, 5) = CONCAT(c.state_fips, c.county_fips) 
+	--Filtering for limited service restaurant
+    WHERE LOWER(a.top_category) LIKE '%restaurant%' 
+    AND LOWER(a.sub_category) LIKE '%limited%' 
+    GROUP BY c.state, c.state_fips, c.county_fips, c.county
+), 
+
+cte_pop_lsr AS
+(
+    SELECT 
+		a.state, a.state_fips, a.county, a.county_fips, b.lsr_restaurant_count, a.total_population, 
+		--Calculating LSR(limited service restaurant) per capita
+		round(b.lsr_restaurant_count / a.total_population,4) AS lsr_restaurant_per_capita 
+    FROM cte_county_population a 
+    INNER JOIN cte_lsr_restaurant b 
+    ON a.state_fips = b.state_fips 
+    AND a.county_fips = b.county_fips 
+    WHERE a.state LIKE 'TX'
+), 
+
+cte_ranking AS
+(
+    SELECT 
+		state, state_fips, county, county_fips, lsr_restaurant_count, total_population, lsr_restaurant_per_capita, lsr_restaurant_per_capita_rank, 
+		PERCENT_RANK() OVER (ORDER BY lsr_restaurant_per_capita_rank) AS lsr_restaurant_per_capita_percentile 
+    FROM
+    (
+        SELECT state, state_fips, county, county_fips, lsr_restaurant_count, total_population, lsr_restaurant_per_capita, 
+        DENSE_RANK() OVER (ORDER BY lsr_restaurant_per_capita ASC) AS lsr_restaurant_per_capita_rank 
+        FROM cte_pop_lsr
+    )
+) 
+
+--Intersecting the counties which are underserved with counties identified in question 1
+SELECT 
+	b.state, b.state_fips, b.county, b.county_fips, b.population_10_35, b.total_population, b.population_10_35_perc, b.population_10_35_rank, 
+	b.income_less_75, b.total_earning_population, b.income_less_75_perc, b.income_less_75_rank, a.lsr_restaurant_count, a.lsr_restaurant_per_capita, a.lsr_restaurant_per_capita_rank 
+FROM cte_ranking a 
+INNER JOIN `group-7-fa24-mgmt58200-final.safegraph.population_filter` b 
+ON a.state_fips = b.state_fips 
+AND a.county_fips = b.county_fips 
+WHERE lsr_restaurant_per_capita_percentile <= 0.33 
+--Since we want to finalize 1 county, we go ahead with the county which fits our criteria and has highest target population
+ORDER BY population_10_35 DESC 
+LIMIT 1;
+
+--Result
+SELECT * 
+FROM `group-7-fa24-mgmt58200-final.safegraph.underserved_filter`;
+
+
+----------------------------------------------------------------------------------------------------------------------------------------
+
+
+--Question 3: Among all the cities in the identified county (Q2), which city ranks at the top in terms of night-time popularity and has a minimum population of 10,000?  
+
+--Table Creation
+CREATE OR REPLACE TABLE `group-7-fa24-mgmt58200-final.safegraph.city_filter` AS
+(
+	--Finding all the city , cbg combination
+    WITH cte_city AS
+    (
+        SELECT DISTINCT 
+			city, poi_cbg AS cbg
+        FROM `group-7-fa24-mgmt58200-final.safegraph.visits`
+    ),
+    
+	--Getting population at cbg level
+    cte_cbg_population AS
+    (
+        SELECT 
+			a.state, a.county, b.cbg, b.pop_total
+        FROM `group-7-fa24-mgmt58200-final.safegraph.underserved_filter` a
+        INNER JOIN `group-7-fa24-mgmt58200-final.safegraph.cbg_demographics` b
+        ON CONCAT(a.state_fips, a.county_fips) = LEFT(b.cbg, 5)
+    ),
+    
+	--Aggregating cbg level to get city wise population
+    cte_city_population AS
+    (
+        SELECT 
+			 b.state, b.county, a.city
+			,SUM(b.pop_total) AS total_population
+        FROM cte_city a
+        INNER JOIN cte_cbg_population b
+        ON a.cbg = b.cbg
+        GROUP BY b.state, b.county, a.city
+        HAVING total_population > 10000
+    )
+    
+    SELECT 
+		state, state_fips, county, county_fips, city, 
+		--Calculating average late night popularity
+		round(AVG(hour_21_to_0_popularity),2) AS avg_late_night_popularity
+    FROM
+    (
+        SELECT 
+			state, state_fips, county, county_fips, city, safegraph_place_id, poi_cbg, date_range_start, popularity_by_hour,
+			--Total Late night popularity
+			CAST(hour_21_value AS INTEGER) + CAST(hour_22_value AS INTEGER) + CAST(hour_23_value AS INTEGER) AS hour_21_to_0_popularity
+        FROM
+        (
+            SELECT 
+				c.state, c.state_fips, c.county, c.county_fips, a.city, a.safegraph_place_id, a.poi_cbg, a.date_range_start, popularity_by_hour,
+				--Filtering out popularity between hours 9 PM to 12 AM
+				SPLIT(REPLACE(REPLACE(popularity_by_hour, '[', ''), ']', ''), ',')[OFFSET(21)] AS hour_21_value,
+				SPLIT(REPLACE(REPLACE(popularity_by_hour, '[', ''), ']', ''), ',')[OFFSET(22)] AS hour_22_value,
+				SPLIT(REPLACE(REPLACE(popularity_by_hour, '[', ''), ']', ''), ',')[OFFSET(23)] AS hour_23_value
+            FROM `group-7-fa24-mgmt58200-final.safegraph.visits` a
+            INNER JOIN `group-7-fa24-mgmt58200-final.safegraph.places` b
+            ON a.safegraph_place_id = b.safegraph_place_id
+            INNER JOIN `group-7-fa24-mgmt58200-final.safegraph.underserved_filter` c
+            ON LEFT(a.poi_cbg, 5) = CONCAT(c.state_fips, c.county_fips)
+            WHERE LOWER(b.top_category) LIKE '%restaurant%'
+            AND LOWER(b.sub_category) LIKE '%limited%'
+        )
+    )
+    WHERE city IN (SELECT city FROM cte_city_population)
+    GROUP BY state, state_fips, county, county_fips, city
+	--Selecting the city with highest night time popularity
+    ORDER BY avg_late_night_popularity DESC
+    LIMIT 1
+);
+
+--Result
+SELECT * 
+FROM `group-7-fa24-mgmt58200-final.safegraph.city_filter`;
+
+
+-----------------------------------------------------------------------------------------------------------------------------------
+
+
+--Question 4: What is the average rent, average property price, average median dwell time (LSRs only) and number of visitors (LSRs only) for each CBG in that city? These are some of the key business metrics which will allow our client to choose a CBG where opening an outlet will be most profitable.  
+
+--Result
+with cte_cbg_list as
+(
+	select b.state ,b.state_fips ,b.county ,b.county_fips ,b.city ,a.poi_cbg as cbg
+		--Total Restaurant in that CBG
+		,count(case when lower(c.top_category) like '%restaurant%' then a.safegraph_place_id end) as total_restaurant
+		--Average visits in restaurants in that CBG
+		,coalesce(avg(case when lower(c.top_category) like '%restaurant%' then a.raw_visit_counts end),0) as avg_visits_per_restaurant
+		--Average Dwell Time in restaurants in that CBG
+		,coalesce(avg(case when lower(c.top_category) like '%restaurant%' then a.median_dwell end),0) as average_dwell_time_per_restaurant
+		--Total LSR Restaurant in that CBG
+		,count(case when lower(c.top_category) like '%restaurant%' and lower(c.sub_category) like '%limited%' then a.safegraph_place_id end) as total_lsr_restaurant
+		--Average visits in LSR Restaurant in that CBG
+		,coalesce(avg(case when lower(c.top_category) like '%restaurant%' and lower(c.sub_category) like '%limited%' then a.raw_visit_counts end),0) as avg_visits_per_lsr_restaurant
+		--Average Dwell Time in LSR restaurants in that CBG
+		,coalesce(avg(case when lower(c.top_category) like '%restaurant%' and lower(c.sub_category) like '%limited%' then a.median_dwell end),0) as average_dwell_time_per_LSR_restaurant
+	from `group-7-fa24-mgmt58200-final.safegraph.visits` a
+	inner join `group-7-fa24-mgmt58200-final.safegraph.city_filter` b
+	on lower(a.city) = lower(b.city)
+	inner join `group-7-fa24-mgmt58200-final.safegraph.places` c
+	on a.safegraph_place_id = c.safegraph_place_id
+	group by b.state,b.state_fips,b.county,b.county_fips,b.city,a.poi_cbg
+)
+
+--Property and Rental prices will help evaluate the overall property value and decide on the budget
+,cte_property_prices as
+(
+	select
+		cbg
+		--Average Home Value in that CBG
+		,((`value_lt10` * 5) + (`value_10-15` * 12.5) + (`value_15-20` * 17.5) + (`value_20-25` * 22.5) 
+		+ (`value_25-30` * 27.5) + (`value_30-35` * 32.5) + (`value_35-40` * 37.5) + (`value_40-50` * 45) 
+		+ (`value_50-60` * 55) + (`value_60-70` * 65) + (`value_70-80` * 75) + (`value_80-90` * 85) 
+		+ (`value_90-100` * 95) + (`value_100-125` * 112.5) + (`value_125-150` * 137.5) + (`value_150-175` * 162.5) 
+		+ (`value_175-200` * 187.5) + (`value_200-250` * 225) + (`value_250-300` * 275) + (`value_300-400` * 350) 
+		+ (`value_400-500` * 450) + (`value_500-750` * 625) + (`value_750-1000` * 875) + (`value_1000-1500` * 1250) 
+		+ (`value_1500-2000` * 1750) + (`value_gte2000` * 2000))/(value_total) as average_property_value
+		--Average Rental price in that CBG
+		,((`rent_lt100` * 50) + (`rent_100-150` * 125) + (`rent_150-200` * 175) + (`rent_200-250` * 225) 
+		+ (`rent_250-300` * 275) + (`rent_300-350` * 325) + (`rent_350-400` * 375) + (`rent_400-450` * 425) 
+		+ (`rent_450-500` * 475) + (`rent_500-550` * 525) + (`rent_550-600` * 575) + (`rent_600-650` * 625) 
+		+ (`rent_650-700` * 675) + (`rent_700-750` * 725) + (`rent_750-800` * 775) + (`rent_800-900` * 850) 
+		+ (`rent_900-1000` * 950) + (`rent_1000-1250` * 1125) + (`rent_1250-1500` * 1375) + (`rent_1500-1999` * 1750) 
+		+ (`rent_2000-2500` * 2250) + (`rent_2500-3000` * 2750) + (`rent_3000-3500` * 3250) + (`rent_gte3500` * 3500))/(rent_total) as average_rental_rent
+	from `group-7-fa24-mgmt58200-final.safegraph.cbg_demographics`
+	where value_total > 0 and rent_total > 0
+)
+
+--All Key Metrics
+select
+	 a.state ,a.state_fips ,a.county ,a.county_fips ,a.city ,a.cbg ,a.total_restaurant 
+	,round(a.avg_visits_per_restaurant,0) as avg_visits_per_restaurant
+	,round(a.average_dwell_time_per_restaurant,0) as average_dwell_time_per_restaurant,a.total_lsr_restaurant
+	,round(a.avg_visits_per_lsr_restaurant,0) as avg_visits_per_lsr_restaurant
+	,round(a.average_dwell_time_per_lsr_restaurant,0) as average_dwell_time_per_lsr_restaurant
+	,round(b.average_property_value * 1000,0) as average_property_value
+	,round(b.average_rental_rent,0) as average_rental_rent
+from
+cte_cbg_list a
+inner join
+cte_property_prices b
+on
+a.cbg = b.cbg;
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------------------------------------------
+
+
+--Initial Data Exploration Questions:
+
+-- 1. What are the different types of industries represented in the dataset? 
+
+-- Analyzing industries which have visits data as well
+-- Query 1:
+select 
+   b.top_category
+from
+`group-7-fa24-mgmt58200-final.safegraph.visits` a
+inner join
+`group-7-fa24-mgmt58200-final.safegraph.places` b
+on
+a.safegraph_place_id = b.safegraph_place_id
+group by b.top_category;
+-- Observation: There are around 175 industries in the Safegraph database
+
+
+-- Query 2:
+select 
+   b.top_category
+  ,b.sub_category
+  ,count(distinct b.safegraph_brand_ids) as total_places
+from
+`group-7-fa24-mgmt58200-final.safegraph.visits` a
+inner join
+`group-7-fa24-mgmt58200-final.safegraph.places` b
+on
+a.safegraph_place_id = b.safegraph_place_id
+group by b.top_category,b.sub_category;
+
+-- Observation: There are around 345 subcategories of various industries in the Safegraph database
+
+---------------------------------------------------------------------------------------------------------------------------------
+
+--2. At what level of location granularity can we get 'visits' data from the dataset?
+
+--Query 1:
+select 
+	 region
+	,city
+	,location_name
+	,poi_cbg
+	,safegraph_place_id
+	,date_range_start
+	,count(*)
+from
+`group-7-fa24-mgmt58200-final.safegraph.visits`
+group by 
+region,city,location_name,poi_cbg,safegraph_place_id,date_range_start
+having count(*)>1;
+
+--Observation: Data is available at state, county, city, poi_cbg levels. Thus we conclude that the most granular level of data is census block group level.
+
+
+---------------------------------------------------------------------------------------------------------------------------------------
+
+--3. What are the primary keys and foreign keys in each table, which will help us join the different tables? 
+
+--Query 1: visits table: Each place has 4 months of data in visits table
+select 
+	 safegraph_place_id
+	,date_range_start
+	,count(*)
+from
+`group-7-fa24-mgmt58200-final.safegraph.visits`
+group by 
+safegraph_place_id,date_range_start
+having count(*)>1;
+
+--Query 2: places table: Each place has its own row in the places table
+select 
+	 safegraph_place_id
+	,count(*)
+from
+`group-7-fa24-mgmt58200-final.safegraph.places`
+group by 
+safegraph_place_id
+having count(*)>1;
+
+--Query 3: Brands table: Each Brand is has its own row in the brands table
+select 
+	 safegraph_brand_id
+	,count(*)
+from
+`group-7-fa24-mgmt58200-final.safegraph.brands`
+group by 
+safegraph_brand_id
+having count(*)>1;
+
+--Query 4: Combination of state and county fips is the level of data in cbg_fips table
+select 
+	 state_fips
+	,county_fips
+	,count(*)
+from
+`group-7-fa24-mgmt58200-final.safegraph.cbg_fips`
+group by 
+state_fips,county_fips
+having count(*)>1;
+
+--Query 5: We have population, education, income and home prices data for each cbg
+select 
+	 cbg
+	,count(*)
+from
+`group-7-fa24-mgmt58200-final.safegraph.cbg_demographics`
+group by 
+cbg
+having count(*)>1;
+
+--------------------------------------------------------------------------------------------------------------------------------
+
+--4. What demographic metrics are available in the dataset – such as population split by gender, income slabs, average property values? 
+
+--Query:
+with visit_cbg as
+(
+	select distinct poi_cbg
+	from
+	`group-7-fa24-mgmt58200-final.safegraph.visits`
+)
+select 
+	a.*
+from
+`group-7-fa24-mgmt58200-final.safegraph.cbg_demographics` a
+inner join
+visit_cbg b
+on
+a.cbg = b.poi_cbg;
+
+--Observation: We have dempgraphic data for all genders, incomes, education levels, rental prices, home prices in the US at a cbg level
+---------------------------------------------------------------------------------------------------------------------------------------
+
+
+--5. Which industry has the highest number of brands featured in the data? 
+
+--Query: Only brands which has visits data as well
+select
+	 b.top_category
+	,count(distinct b.safegraph_brand_id) as total_brands
+from
+`group-7-fa24-mgmt58200-final.safegraph.visits` a
+inner join
+`group-7-fa24-mgmt58200-final.safegraph.brands` b
+on
+a.safegraph_brand_ids = b.safegraph_brand_id
+group by b.top_category
+order by total_brands desc;
+
+-- Observation: Restatuants seem to have the highest number of brands. This further reinforces our decision to choose Restatuants as the targeted industry.
+
+-----------------------------------------------------------------------------------------------------------------------
+
+--6. What are the different sub-categories of restaurants available in the data?
+
+--Query: Only places which has visits data as well
+select
+	 top_category
+	,sub_category
+	,count(distinct a.safegraph_place_id) as total_places
+from
+`group-7-fa24-mgmt58200-final.safegraph.places` a
+inner join
+`group-7-fa24-mgmt58200-final.safegraph.visits` b
+on
+a.safegraph_place_id = b.safegraph_place_id
+where
+lower(a.top_category) like '%restaurant%'
+group by a.top_category,a.sub_category;
+
+--Observation: There are 4 subcategories of restaurants: Full-Service Restaurants, Limited-Service Restaurants, Snack and Nonalcoholic Beverage Bars, Cafeterias, Grill Buffets, and Buffets. Full service restaurant have the maximum count
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+--7. How many restaurant brands are listed on the stock exchange? 
+
+--Query:
+select
+	 b.top_category
+	,count (distinct case when coalesce(b.stock_symbol,'') <> '' then b.safegraph_brand_id end) as total_listed_brands
+	,count (distinct case when coalesce(b.stock_symbol,'') = '' then b.safegraph_brand_id end) as total_unlisted_brands
+from
+`group-7-fa24-mgmt58200-final.safegraph.visits` a
+inner join
+`group-7-fa24-mgmt58200-final.safegraph.brands` b
+on
+a.safegraph_brand_ids = b.safegraph_brand_id
+where
+lower(b.top_category) like '%restaurant%'
+group by b.top_category;
+
+--Observation: There are around 95 listed brands and 1326 unlisted brands
+
+-------------------------------------------------------------------------------------------------------------------------------------
+
+--8. What are the top cities in terms of ratio of the number of restaurants to the population (considering cities with population >=20k)? 
+
+--Query:
+with city_places as
+(
+	select
+		 a.city
+		,a.poi_cbg
+		,count(distinct a.safegraph_place_id) as t_restaurants
+	from
+	`group-7-fa24-mgmt58200-final.safegraph.visits` a
+	inner join
+	`group-7-fa24-mgmt58200-final.safegraph.places` b
+	on
+	a.safegraph_place_id = b.safegraph_place_id
+	where
+	lower(b.top_category) like '%restaurant%'
+	and
+	a.city is not null
+	group by a.city,a.poi_cbg
+)
+select
+	 a.city
+	,sum(a.t_restaurants) as total_restaurants
+	,sum(b.pop_total) as total_population
+	,sum(a.t_restaurants)/sum(b.pop_total) as restaurants_per_capita
+from
+city_places a
+inner join
+`group-7-fa24-mgmt58200-final.safegraph.cbg_demographics` b
+on
+a.poi_cbg = b.cbg
+group by a.city
+having sum(b.pop_total)>=20000
+order by restaurants_per_capita desc;
+
+--Observation: Honolulu seems to be a the top with 1 restaurant for evvery 100 people
+
+-------------------------------------------------------------------------------------------------------------------------------------
+
+--9. Which state has the highest population proportion of high-income individuals? 
+
+--Query: High Income Individual = Salary > 100k
+with cte_state_mapping as
+(
+	select distinct
+		state
+		,state_fips
+	from
+	group-7-fa24-mgmt58200-final.safegraph.cbg_fips`
+)
+
+select 
+	 b.state
+	,b.state_fips
+	,sum(`inc_100-125` + `inc_125-150` + `inc_150-200` + inc_gte200) as high_income_population
+	,sum(inc_total) as total_income_proportion
+	,sum(`inc_100-125` + `inc_125-150` + `inc_150-200` + inc_gte200)/sum(inc_total) as high_income_proportion
+from
+`group-7-fa24-mgmt58200-final.safegraph.cbg_demographics` a
+inner join
+cte_state_mapping b
+on
+left(a.cbg,2) = b.state_fips
+group by b.state,b.state_fips
+order by high_income_proportion desc;
+
+--Observation: Maryland seems to have the highest proportion of high income individuals
+
+----------------------------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------------------------------------------
